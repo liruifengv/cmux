@@ -1467,6 +1467,13 @@ final class MobileHostService {
             kSecAttrService as String: irohSecretKeyKeychainService,
             kSecReturnData as String: true,
             kSecMatchLimit as String: kSecMatchLimitOne,
+            // Never block on a keychain authorization dialog: decrypting an item
+            // created by a differently-signed earlier build makes securityd wait
+            // on user consent, which (observed via `sample`) wedged the whole
+            // MobileHostService.start() path inside SecItemCopyMatching on a
+            // background launch. Fail fast instead; the rewrite below replaces
+            // the inaccessible item with one this binary owns.
+            kSecUseAuthenticationUI as String: kSecUseAuthenticationUIFail,
         ]
         var result: CFTypeRef?
         let readStatus = SecItemCopyMatching(readQuery as CFDictionary, &result)
@@ -1491,9 +1498,13 @@ final class MobileHostService {
         var writeStatus = SecItemAdd(insert as CFDictionary, nil)
         if writeStatus == errSecDuplicateItem {
             // The old item survived the delete (e.g. ACL held by a previous
-            // build): overwrite its value in place instead of giving up.
+            // build): overwrite its value in place instead of giving up. The
+            // no-UI flag keeps an ACL-guarded update from blocking on a consent
+            // dialog the same way the read could.
+            var updateQuery = itemQuery
+            updateQuery[kSecUseAuthenticationUI as String] = kSecUseAuthenticationUIFail
             writeStatus = SecItemUpdate(
-                itemQuery as CFDictionary,
+                updateQuery as CFDictionary,
                 [kSecValueData as String: key] as CFDictionary
             )
         }
