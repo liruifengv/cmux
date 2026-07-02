@@ -1,5 +1,6 @@
 import CmuxAgentChat
 import CmuxAgentChatUI
+import CMUXMobileCore
 import CmuxMobileBrowser
 import CmuxMobileDiagnostics
 import CmuxMobileShell
@@ -33,6 +34,7 @@ struct WorkspaceDetailView: View {
     let signOut: (() -> Void)?
     /// Phone-local browser surfaces, injected from the app root.
     @Environment(BrowserSurfaceStore.self) private var browserStore
+    @Environment(\.tailscaleStatusMonitor) private var tailscaleStatusMonitor
     /// Drives the destructive close-workspace confirmation dialog.
     @State var isConfirmingClose = false
     #if canImport(UIKit)
@@ -270,6 +272,20 @@ struct WorkspaceDetailView: View {
             } else {
                 TerminalPalette.background
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                    .overlay {
+                        TerminalLoadingDiagnosticsOverlay(
+                            workspace: workspace,
+                            host: host,
+                            connectionStatus: connectionStatus,
+                            tailnetStatus: tailscaleStatusMonitor?.status,
+                            activeRoute: activeLoadingDiagnosticsRoute,
+                            storedRouteDescription: loadingDiagnosticsMacSnapshot?.routeDescription,
+                            connectionError: store.connectionError,
+                            connectionErrorGuidance: store.connectionErrorGuidance,
+                            createTerminal: createTerminal,
+                            canCreateTerminal: canCreateWorkspace
+                        )
+                    }
             }
             #else
             TerminalPalette.background
@@ -720,5 +736,30 @@ struct WorkspaceDetailView: View {
         // it; then sweep any other responder across the scene.
         GhosttySurfaceView.resignActiveInput()
         UIApplication.shared.dismissMobileKeyboard()
+    }
+
+    private var loadingDiagnosticsMacSnapshot: MacComputerSnapshot? {
+        guard let macDeviceID = workspace.macDeviceID,
+              !macDeviceID.isEmpty else {
+            return nil
+        }
+        return MacComputerSnapshot.snapshots(from: store).first { snapshot in
+            snapshot.deviceId == macDeviceID || snapshot.aliasIDs.contains(macDeviceID)
+        }
+    }
+
+    private var activeLoadingDiagnosticsRoute: CmxAttachRoute? {
+        guard let macDeviceID = workspace.macDeviceID,
+              !macDeviceID.isEmpty else {
+            return nil
+        }
+        if macDeviceID == store.connectedMacDeviceID {
+            return store.activeRoute
+        }
+        guard let connectedMacDeviceID = store.connectedMacDeviceID,
+              store.pairedMacAliasIDs(for: macDeviceID).contains(connectedMacDeviceID) else {
+            return nil
+        }
+        return store.activeRoute
     }
 }
