@@ -712,6 +712,33 @@ final class TerminalControllerSocketSecurityTests {
         }
     }
 
+    @Test func testV1PingRunsOnWorkerLaneAndStaysMainThreadCallable() throws {
+        let socketPath = makeSocketPath("v1-ping")
+        let tabManager = TabManager()
+        TerminalController.shared.start(
+            tabManager: tabManager,
+            socketPath: socketPath,
+            accessMode: .allowAll
+        )
+        try waitForSocket(at: socketPath)
+
+        // v1 `ping` sits on the worker lane
+        // (`ControlCommandExecutionPolicy(forV1Command:)`) but is
+        // mainThreadCallable, so in-process main-thread dispatch must answer
+        // inline instead of tripping the v1 invalid-dispatch guard.
+        XCTAssertEqual(TerminalController.shared.handleSocketLine("ping"), "PONG")
+        XCTAssertEqual(TerminalController.shared.handleSocketLine("PING"), "PONG")
+
+        // Over the socket it answers on the worker lane without a main hop.
+        let responses = try sendCommands(["ping"], to: socketPath)
+        XCTAssertEqual(responses, ["PONG"])
+
+        // A main-lane v1 command still round-trips through the main hop.
+        let mainLane = try sendCommands(["current_workspace"], to: socketPath)
+        XCTAssertEqual(mainLane.count, 1)
+        XCTAssertFalse(mainLane[0].isEmpty)
+    }
+
     private func assertHeartbeatResult(method: String, envelope: [String: Any], file: StaticString = #filePath, line: UInt = #line) throws {
         let result = try XCTUnwrap(envelope["result"] as? [String: Any], method, file: file, line: line)
         switch method {

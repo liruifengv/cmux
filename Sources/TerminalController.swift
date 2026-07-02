@@ -17,6 +17,7 @@ import Carbon.HIToolbox
 import CMUXMobileCore
 import CMUXAgentLaunch
 import Foundation
+import os
 import Bonsplit
 import WebKit
 import CmuxSidebar
@@ -35,6 +36,20 @@ nonisolated private struct SocketLineProcessingResult: Sendable {
     let response: String?
     let authenticated: Bool
 }
+
+#if DEBUG
+/// Accumulated worker→main `v2MainSync` hop time for the socket command
+/// currently executing on a worker thread. Confined to one thread: it lives in
+/// that thread's `threadDictionary`, `processSocketLine` installs a fresh
+/// instance per command, `v2MainSync` mutates it in place (no per-hop
+/// allocation), and the end-of-command debug log on the same thread reads the
+/// totals. It never crosses threads, so it is intentionally not Sendable.
+nonisolated private final class SocketCommandMainHopAccumulator {
+    var queueWaitNanos: UInt64 = 0
+    var bodyNanos: UInt64 = 0
+    var hopCount: Int = 0
+}
+#endif
 
 nonisolated private struct RemotePTYSocketTarget {
     let controller: RemoteSessionCoordinator?
@@ -135,6 +150,15 @@ class TerminalController {
     private nonisolated let sidebarMetadataArgumentParser = SidebarMetadataArgumentParser()
     private nonisolated let myPid = getpid()
     private nonisolated static let socketCommandFocusAllowanceStackKey = "cmux.socketCommandFocusAllowanceStack"
+    private nonisolated static let socketCommandKeyStackKey = "cmux.socketCommandKeyStack"
+    /// Signposter for the worker→main `v2MainSync` hop. Intervals are named
+    /// "main-hop" and carry the active socket command key plus queue-wait and
+    /// body durations, so Instruments can attribute main-thread occupancy per
+    /// socket command.
+    private nonisolated static let socketMainHopSignposter = OSSignposter(
+        subsystem: "com.cmux.socket",
+        category: "main-hop"
+    )
     private nonisolated static let socketListenerFailureCaptureCooldown: TimeInterval = 60
     private nonisolated static let v2BrowserDownloadWaitDefaultTimeoutMs = 10_000
     private nonisolated static let v2BrowserDownloadWaitMaxTimeoutMs = 120_000
@@ -421,12 +445,20 @@ class TerminalController {
         var stack = Self.currentSocketCommandFocusAllowanceStack()
         stack.append(allowsFocusMutation)
         Self.setCurrentSocketCommandFocusAllowanceStack(stack)
+        var keyStack = Self.currentSocketCommandKeyStack()
+        keyStack.append(commandKey)
+        Self.setCurrentSocketCommandKeyStack(keyStack)
         defer {
             var stack = Self.currentSocketCommandFocusAllowanceStack()
             if !stack.isEmpty {
                 _ = stack.popLast()
             }
             Self.setCurrentSocketCommandFocusAllowanceStack(stack)
+            var keyStack = Self.currentSocketCommandKeyStack()
+            if !keyStack.isEmpty {
+                _ = keyStack.popLast()
+            }
+            Self.setCurrentSocketCommandKeyStack(keyStack)
         }
         return body()
     }
@@ -448,6 +480,27 @@ class TerminalController {
         setCurrentSocketCommandFocusAllowanceStack(stack)
         defer { setCurrentSocketCommandFocusAllowanceStack(previous) }
         return body()
+    }
+
+    /// The stack of socket command keys currently executing on this thread
+    /// (parallel to the focus-allowance stack pushed by
+    /// `withSocketCommandPolicy`). `v2MainSync` reads the innermost key to
+    /// attribute its main-hop signpost interval; nothing propagates the key
+    /// stack across the hop because timing is recorded on the worker side.
+    private nonisolated static func currentSocketCommandKeyStack() -> [String] {
+        Thread.current.threadDictionary[socketCommandKeyStackKey] as? [String] ?? []
+    }
+
+    private nonisolated static func setCurrentSocketCommandKeyStack(_ stack: [String]) {
+        if stack.isEmpty {
+            Thread.current.threadDictionary.removeObject(forKey: socketCommandKeyStackKey)
+        } else {
+            Thread.current.threadDictionary[socketCommandKeyStackKey] = stack
+        }
+    }
+
+    private nonisolated static func currentSocketCommandKey() -> String? {
+        currentSocketCommandKeyStack().last
     }
 
 #if DEBUG
@@ -935,42 +988,59 @@ class TerminalController {
         ControlCommandExecutionPolicy(forMethod: method)
     }
 
-    private nonisolated func parseV2SocketRequest(_ command: String) -> V2SocketRequest? {
-        guard let request = Self.v2Parser.lenientRequest(fromLine: command) else {
-            return nil
-        }
-        return V2SocketRequest(bridging: request)
-    }
-
-    private nonisolated func socketWorkerV2ResponseIfHandled(for command: String) -> (handled: Bool, response: String?) {
-        guard let request = parseV2SocketRequest(command),
-              Self.executionPolicy(forV2Method: request.method).runsOnSocketWorker else {
-            return (false, nil)
-        }
-
+    /// Runs one worker-lane v2 request on the calling socket-worker thread and
+    /// returns its encoded response, or `nil` when the command sends no reply
+    /// (`feed.push` without an id). The caller (the socket execution-policy
+    /// dispatcher) has already parsed the line and checked the policy.
+    private nonisolated func socketWorkerV2Response(handling parsedRequest: ControlRequest) -> String? {
+        let request = V2SocketRequest(bridging: parsedRequest)
         return withSocketCommandPolicy(commandKey: request.method, isV2: true, params: request.params) {
             if let workspaceParamError = v2UnsupportedWorkspaceAliasError(method: request.method, params: request.params) {
-                return (true, v2Result(id: request.id, workspaceParamError))
+                return v2Result(id: request.id, workspaceParamError)
             }
             if request.method == "feed.push", request.id == nil {
                 guard let waitTimeout = Self.feedPushWaitTimeoutSeconds(params: request.params) else {
-                    return (true, v2Error(
+                    return v2Error(
                         id: request.id,
                         code: "invalid_params",
                         message: "feed.push wait_timeout_seconds must be numeric and between 0 and 120"
-                    ))
+                    )
                 }
                 guard waitTimeout == 0 else {
-                    return (true, v2Error(
+                    return v2Error(
                         id: request.id,
                         code: "invalid_params",
                         message: "feed.push without an id requires wait_timeout_seconds 0"
-                    ))
+                    )
                 }
                 _ = socketWorkerV2Response(request)
-                return (true, nil)
+                return nil
             }
-            return (true, socketWorkerV2Response(request))
+            return socketWorkerV2Response(request)
+        }
+    }
+
+    /// Runs a worker-lane v1 command on the calling socket-worker thread,
+    /// mirroring `socketWorkerV2Response(handling:)` for the space-delimited
+    /// protocol. Returns `handled: false` when the command is not on the v1
+    /// worker lane (the dispatcher falls through to the main hop). `response`
+    /// stays optional so future fire-and-forget v1 telemetry can reply with
+    /// nothing, matching the v2 lane's contract.
+    private nonisolated func socketWorkerV1ResponseIfHandled(cmd: String, args: String) -> (handled: Bool, response: String?) {
+        guard ControlCommandExecutionPolicy(forV1Command: cmd).runsOnSocketWorker else {
+            return (false, nil)
+        }
+        let policyParams = cmd == "right_sidebar" ? ["args": args] : [:]
+        return withSocketCommandPolicy(commandKey: cmd, isV2: false, params: policyParams) {
+            switch cmd {
+            case "ping":
+                return (true, "PONG")
+            default:
+                // Keep `socketWorkerV1Commands` and this switch in lockstep: a
+                // policy entry without a worker body here falls back to the
+                // main-lane dispatcher instead of failing.
+                return (false, nil)
+            }
         }
     }
 
@@ -1278,6 +1348,7 @@ class TerminalController {
         let debugInfo = Self.socketCommandDebugInfo(command)
         let debugStart = DispatchTime.now().uptimeNanoseconds
         let debugLoggingEnabled = Self.socketCommandDebugLoggingEnabled()
+        Self.installSocketCommandMainHopAccumulator()
         if debugLoggingEnabled {
             Self.debugLogSocketCommand(
                 "socket.command.begin proto=\(debugInfo.protocolName) method=\(debugInfo.commandKey)"
@@ -1511,42 +1582,103 @@ class TerminalController {
             return
         }
         let elapsedText = String(format: "%.2f", elapsedMs)
+        // Total-vs-main-hop breakdown: how much of the command's wall time was
+        // spent waiting for and occupying the main thread across its
+        // `v2MainSync` hops. All formatting stays behind the guard above.
+        var mainHopText = ""
+        if let mainHops = currentSocketCommandMainHopAccumulator(), mainHops.hopCount > 0 {
+            let waitText = String(format: "%.2f", Double(mainHops.queueWaitNanos) / 1_000_000)
+            let bodyText = String(format: "%.2f", Double(mainHops.bodyNanos) / 1_000_000)
+            mainHopText = " main_hops=\(mainHops.hopCount) main_wait_ms=\(waitText) main_body_ms=\(bodyText)"
+        }
         debugLogSocketCommand(
-            "socket.command.end proto=\(debugInfo.protocolName) method=\(debugInfo.commandKey) status=\(status) ms=\(elapsedText) bytes=\(response.utf8.count)"
+            "socket.command.end proto=\(debugInfo.protocolName) method=\(debugInfo.commandKey) status=\(status) ms=\(elapsedText)\(mainHopText) bytes=\(response.utf8.count)"
         )
     }
 
     private nonisolated static func debugLogSocketCommand(_ message: @autoclosure () -> String) {
         cmuxDebugLog(message())
     }
+
+    private nonisolated static let socketCommandMainHopAccumulatorKey = "cmux.socketCommandMainHopAccumulator"
+
+    /// Installs a fresh per-command main-hop accumulator on the current
+    /// (socket worker) thread. Called once per socket line so the totals in
+    /// the end-of-command log cover exactly that command's hops.
+    private nonisolated static func installSocketCommandMainHopAccumulator() {
+        Thread.current.threadDictionary[socketCommandMainHopAccumulatorKey] = SocketCommandMainHopAccumulator()
+    }
+
+    /// Adds one `v2MainSync` hop to the current thread's accumulator, if a
+    /// socket command installed one (in-process `handleSocketLine` callers
+    /// have no accumulator and record nothing).
+    private nonisolated static func recordSocketCommandMainHop(queueWaitNanos: UInt64, bodyNanos: UInt64) {
+        guard let accumulator = Thread.current.threadDictionary[socketCommandMainHopAccumulatorKey]
+                as? SocketCommandMainHopAccumulator else {
+            return
+        }
+        accumulator.queueWaitNanos &+= queueWaitNanos
+        accumulator.bodyNanos &+= bodyNanos
+        accumulator.hopCount += 1
+    }
+
+    private nonisolated static func currentSocketCommandMainHopAccumulator() -> SocketCommandMainHopAccumulator? {
+        Thread.current.threadDictionary[socketCommandMainHopAccumulatorKey] as? SocketCommandMainHopAccumulator
+    }
 #endif
 
     private nonisolated func processCommandUsingSocketExecutionPolicy(_ command: String) -> String? {
+        let trimmed = command.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if trimmed.hasPrefix("{") {
+            // v2: parse exactly once, on the calling thread (the socket-worker
+            // connection thread for socket traffic). The parsed request is
+            // handed to the worker lane or into the main hop; nothing
+            // re-parses on the main thread.
+            let request: ControlRequest
+            switch Self.v2Parser.request(fromLine: trimmed) {
+            case .failure(let parseError):
+                return Self.v2Encoder.response(for: parseError)
+            case .success(let parsed):
+                request = parsed
+            }
+
+            let policy = Self.executionPolicy(forV2Method: request.method)
+            if Thread.isMainThread, policy == .socketWorker(mainThreadCallable: false) {
+                return v2Error(
+                    id: request.id.map(\.foundationObject),
+                    code: "invalid_dispatch",
+                    message: "\(request.method) must run off the main thread"
+                )
+            }
+            if policy.runsOnSocketWorker {
+                return socketWorkerV2Response(handling: request)
+            }
+            return processParsedV2Command(request)
+        }
+
+        let parts = trimmed.split(separator: " ", maxSplits: 1).map(String.init)
+        guard let commandToken = parts.first else {
+            // Empty line: let the main-lane dispatcher produce the legacy
+            // "ERROR: Empty command" reply.
+            return v2MainSync {
+                self.processCommand(command)
+            }
+        }
+        let cmd = commandToken.lowercased()
+        let args = parts.count > 1 ? parts[1] : ""
+
         if Thread.isMainThread,
-           let request = parseV2SocketRequest(command),
-           Self.executionPolicy(forV2Method: request.method) == .socketWorker(mainThreadCallable: false) {
-            return v2Error(
-                id: request.id,
-                code: "invalid_dispatch",
-                message: "\(request.method) must run off the main thread"
-            )
+           ControlCommandExecutionPolicy(forV1Command: cmd) == .socketWorker(mainThreadCallable: false) {
+            return "ERROR: \(cmd) must run off the main thread"
         }
 
-        let socketWorkerResult = socketWorkerV2ResponseIfHandled(for: command)
-        if socketWorkerResult.handled {
-            guard let response = socketWorkerResult.response else {
-                return nil
-            }
-            return response
+        let workerV1 = socketWorkerV1ResponseIfHandled(cmd: cmd, args: args)
+        if workerV1.handled {
+            return workerV1.response
         }
 
-        if command.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "ping" {
-            return withSocketCommandPolicy(commandKey: "ping", isV2: false) {
-                "PONG"
-            }
-        }
-
-        return v2MainSync {
+        return v2MainSync(commandKey: cmd) {
             self.processCommand(command)
         }
     }
@@ -1760,18 +1892,37 @@ class TerminalController {
         processV2Command(jsonLine)
     }
 
-    private func processV2Command(_ jsonLine: String) -> String {
+    /// Parses and dispatches a v2 line on the calling thread. Socket traffic
+    /// enters through `processCommandUsingSocketExecutionPolicy`, which parses
+    /// before this point; this entry serves in-process callers
+    /// (`runV2CommandLine`, and `processCommand`'s v2 branch), so it may parse
+    /// on its calling thread.
+    private nonisolated func processV2Command(_ jsonLine: String) -> String {
         // v1 access-mode gating applies to v2 as well. We can't know which v2 method maps
         // to which v1 command without parsing, so parse first and then apply allow-list.
-
-        let request: ControlRequest
         switch Self.v2Parser.request(fromLine: jsonLine) {
         case .failure(let parseError):
             return Self.v2Encoder.response(for: parseError)
-        case .success(let parsed):
-            request = parsed
+        case .success(let request):
+            return processParsedV2Command(request)
         }
+    }
 
+    /// The main-hop outcome of one main-lane v2 command: either a typed
+    /// result whose JSON bridging/serialization runs on the socket-worker
+    /// thread after the hop, or a response the legacy switch already encoded
+    /// on the main actor (see `v2LegacyMainActorResponse`).
+    private enum V2MainHopOutcome {
+        case callResult(ControlCallResult)
+        case encoded(String)
+    }
+
+    /// Dispatches one already-parsed main-lane v2 request from the calling
+    /// thread (the socket-worker connection thread for socket traffic; main
+    /// for in-process callers). Policy checks and response encoding stay on
+    /// the calling thread; only the command body crosses to the main actor,
+    /// via a single `v2MainSync` hop.
+    private nonisolated func processParsedV2Command(_ request: ControlRequest) -> String {
         let bridged = V2SocketRequest(bridging: request)
         let id: Any? = bridged.id
         let method = bridged.method
@@ -1790,17 +1941,44 @@ class TerminalController {
                 return v2Result(id: id, workspaceParamError)
             }
 
-            v2MainSync { self.v2RefreshKnownRefs() }
-
-            // Domains migrated into CmuxControlSocket's ControlCommandCoordinator
-            // (window so far) answer here, on the main actor, and encode through
-            // the same encoder/id; everything else falls through to the legacy
-            // switch below. processV2Command already runs on main, so the
-            // coordinator's bodies need no per-read v2MainSync hop.
-            if let coordinatorResult = controlCommandCoordinator.handle(request) {
-                return Self.v2Encoder.response(id: request.id, coordinatorResult)
+            let outcome = v2MainSync {
+                self.v2MainActorResponse(request: request, id: id, method: method, params: params)
             }
+            switch outcome {
+            case .callResult(let result):
+                return Self.v2Encoder.response(id: request.id, result)
+            case .encoded(let response):
+                return response
+            }
+        }
+    }
 
+    /// The main-actor body of one main-lane v2 command: the known-ref
+    /// refresh, then the coordinator, then the legacy switch. The
+    /// coordinator's typed result returns unencoded so the socket worker
+    /// serializes it after the hop.
+    private func v2MainActorResponse(request: ControlRequest, id: Any?, method: String, params: [String: Any]) -> V2MainHopOutcome {
+        v2RefreshKnownRefs()
+
+        // Domains migrated into CmuxControlSocket's ControlCommandCoordinator
+        // answer here, on the main actor, through the same encoder/id as the
+        // legacy switch (the worker encodes the typed result after the hop);
+        // everything else falls through to the legacy switch below.
+        if let coordinatorResult = controlCommandCoordinator.handle(request) {
+            return .callResult(coordinatorResult)
+        }
+        return .encoded(v2LegacyMainActorResponse(id: id, method: method, params: params))
+    }
+
+    /// The not-yet-migrated v2 main-actor command bodies.
+    ///
+    /// TODO(cli-off-main): these handlers still build AND encode their JSON
+    /// response inside the main hop (`v2Ok`/`v2Result`/`v2Error` run here, on
+    /// the main actor). As each case migrates onto the coordinator, or starts
+    /// returning `V2CallResult` for the dispatcher's off-main encode tail in
+    /// `processParsedV2Command`, its serialization cost leaves the main
+    /// thread.
+    private func v2LegacyMainActorResponse(id: Any?, method: String, params: [String: Any]) -> String {
             switch method {
         case "system.ping":
             return v2Ok(id: id, result: ["pong": true])
@@ -1940,7 +2118,6 @@ class TerminalController {
             default:
                 return v2Error(id: id, code: "method_not_found", message: "Unknown method")
             }
-        }
     }
 
     private nonisolated func v2Capabilities() -> [String: Any] {
@@ -2916,7 +3093,7 @@ class TerminalController {
         return trimmed.isEmpty ? nil : trimmed
     }
 
-    nonisolated func v2MainSync<T>(_ body: @MainActor () -> T) -> T {
+    nonisolated func v2MainSync<T>(commandKey: String? = nil, _ body: @MainActor () -> T) -> T {
         let policyStack = Self.currentSocketCommandFocusAllowanceStack()
         if Thread.isMainThread {
             return MainActor.assumeIsolated {
@@ -2925,13 +3102,47 @@ class TerminalController {
                 }
             }
         }
-        return DispatchQueue.main.sync {
-            MainActor.assumeIsolated {
+        // Per-hop timing: queue-wait (enqueue → body start) and body duration,
+        // attributed to `commandKey` (or the innermost key pushed by
+        // `withSocketCommandPolicy` on this thread). The fast path with
+        // signposts disabled costs two clock reads plus, in DEBUG, one
+        // thread-local lookup for the per-command accumulator; all string
+        // formatting stays behind the signpost-enabled check.
+        let signposter = Self.socketMainHopSignposter
+        var signpostState: OSSignpostIntervalState?
+        if signposter.isEnabled {
+            let key = commandKey ?? Self.currentSocketCommandKey() ?? "-"
+            signpostState = signposter.beginInterval(
+                "main-hop",
+                id: signposter.makeSignpostID(),
+                "\(key, privacy: .public)"
+            )
+        }
+        let enqueuedAt = DispatchTime.now().uptimeNanoseconds
+        var bodyStartedAt = enqueuedAt
+        let result: T = DispatchQueue.main.sync {
+            bodyStartedAt = DispatchTime.now().uptimeNanoseconds
+            return MainActor.assumeIsolated {
                 Self.withSocketCommandPolicyStack(policyStack) {
                     body()
                 }
             }
         }
+        let endedAt = DispatchTime.now().uptimeNanoseconds
+        if let signpostState {
+            signposter.endInterval(
+                "main-hop",
+                signpostState,
+                "wait_ns=\(bodyStartedAt - enqueuedAt) body_ns=\(endedAt - bodyStartedAt)"
+            )
+        }
+#if DEBUG
+        Self.recordSocketCommandMainHop(
+            queueWaitNanos: bodyStartedAt - enqueuedAt,
+            bodyNanos: endedAt - bodyStartedAt
+        )
+#endif
+        return result
     }
 
     private nonisolated func v2Ok(id: Any?, result: Any) -> String {
